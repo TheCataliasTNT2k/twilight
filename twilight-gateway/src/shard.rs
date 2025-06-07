@@ -41,7 +41,8 @@ use tokio::{
     sync::oneshot,
     time::{self, Duration, Instant, Interval, MissedTickBehavior},
 };
-use tokio_websockets::{ClientBuilder, Error as WebsocketError, Limits, MaybeTlsStream};
+use tokio_websockets::{ClientBuilder, Error as WebsocketError, Error, Limits, MaybeTlsStream};
+use tracing::info;
 use twilight_model::gateway::{
     event::GatewayEventDeserializer,
     payload::{
@@ -557,7 +558,7 @@ impl<Q: Queue> Shard<Q> {
     /// * `Poll::Pending` if sending is in progress
     /// * `Poll::Ready(Ok)` if no more scheduled commands remain
     /// * `Poll::Ready(Err)` if sending a command failed.
-    fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WebsocketError>> {
+    fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<bool, WebsocketError>> {
         loop {
             if let Some(pending) = self.pending.as_mut() {
                 ready!(Pin::new(self.connection.as_mut().unwrap()).poll_ready(cx))?;
@@ -605,6 +606,7 @@ impl<Q: Queue> Shard<Q> {
                 if self.latency.sent().is_some() && !self.heartbeat_interval_event {
                     tracing::info!("connection is failed or \"zombied\"");
                     self.disconnect(CloseInitiator::Shard(CloseFrame::RESUME));
+                    return Poll::Ready(Ok(false));
                 } else {
                     tracing::debug!("sending heartbeat");
                     self.pending = Pending::text(
@@ -672,7 +674,7 @@ impl<Q: Queue> Shard<Q> {
                 }
             }
 
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(true));
         }
     }
 
@@ -875,11 +877,20 @@ impl<Q: Queue + Unpin> Stream for Shard<Q> {
                 _ => {}
             }
 
-            if ready!(self.poll_send(cx)).is_err() {
-                self.disconnect(CloseInitiator::Transport);
-                self.connection = None;
+            match ready!(self.poll_send(cx)) {
+                Ok(v) => {
+                    if !v { 
+                        info!("connection got corrupted, reconnecting");
+                        self.connection = None;
+                        continue;
+                    }
+                }
+                Err(_) => {
+                    self.disconnect(CloseInitiator::Transport);
+                    self.connection = None;
 
-                return Poll::Ready(Some(Ok(Message::ABNORMAL_CLOSE)));
+                    return Poll::Ready(Some(Ok(Message::ABNORMAL_CLOSE)));
+                }
             }
 
             match ready!(Pin::new(self.connection.as_mut().unwrap()).poll_next(cx)) {
